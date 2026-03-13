@@ -490,6 +490,35 @@ async function main(): Promise<void> {
 
   // Channel callbacks (shared by all channels)
   const channelOpts = {
+    autoRegisterGroup: (
+      jid: string,
+      name: string,
+      folderHint: string,
+    ): boolean => {
+      // Deduplicate: check if folder is already taken
+      const existingFolders = new Set(
+        Object.values(registeredGroups).map((g) => g.folder),
+      );
+      let folder = folderHint;
+      if (existingFolders.has(folder)) {
+        const suffix = jid.replace(/^dc:/, '').slice(-6);
+        folder = `${folderHint.slice(0, 57)}_${suffix}`;
+      }
+
+      try {
+        registerGroup(jid, {
+          name,
+          folder,
+          trigger: `@${ASSISTANT_NAME}`,
+          added_at: new Date().toISOString(),
+          requiresTrigger: true,
+        });
+        return true;
+      } catch (err) {
+        logger.warn({ jid, folder, err }, 'Failed to auto-register group');
+        return false;
+      }
+    },
     onMessage: (chatJid: string, msg: NewMessage) => {
       // Sender allowlist drop mode: discard messages from denied senders before storing
       if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
