@@ -1,6 +1,10 @@
 import { Client, Events, GatewayIntentBits, Message, TextChannel } from 'discord.js';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import {
+  ASSISTANT_NAME,
+  DISCORD_AUTO_REGISTER_GUILDS,
+  TRIGGER_PATTERN,
+} from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -15,6 +19,7 @@ export interface DiscordChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  autoRegisterGroup?: (jid: string, name: string, folderHint: string) => boolean;
 }
 
 export class DiscordChannel implements Channel {
@@ -128,13 +133,39 @@ export class DiscordChannel implements Channel {
       this.opts.onChatMetadata(chatJid, timestamp, chatName, 'discord', isGroup);
 
       // Only deliver full message for registered groups
-      const group = this.opts.registeredGroups()[chatJid];
+      let group = this.opts.registeredGroups()[chatJid];
       if (!group) {
-        logger.debug(
-          { chatJid, chatName },
-          'Message from unregistered Discord channel',
-        );
-        return;
+        // Auto-register if guild is whitelisted
+        if (
+          message.guild &&
+          DISCORD_AUTO_REGISTER_GUILDS.has(message.guild.id) &&
+          this.opts.autoRegisterGroup
+        ) {
+          const textCh = message.channel as TextChannel;
+          const sanitized = textCh.name.replace(/[^a-zA-Z0-9_-]/g, '');
+          const folderHint = sanitized
+            ? `dc_${sanitized.slice(0, 58)}`
+            : `dc_${channelId.slice(-12)}`;
+          const registered = this.opts.autoRegisterGroup(
+            chatJid,
+            chatName,
+            folderHint,
+          );
+          if (registered) {
+            group = this.opts.registeredGroups()[chatJid];
+            logger.info(
+              { chatJid, chatName, folder: folderHint },
+              'Auto-registered Discord channel',
+            );
+          }
+        }
+        if (!group) {
+          logger.debug(
+            { chatJid, chatName },
+            'Message from unregistered Discord channel',
+          );
+          return;
+        }
       }
 
       // Deliver message — startMessageLoop() will pick it up
