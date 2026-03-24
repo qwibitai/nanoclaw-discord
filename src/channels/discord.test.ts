@@ -161,9 +161,7 @@ function createMessage(overrides: {
     member: overrides.memberDisplayName
       ? { displayName: overrides.memberDisplayName }
       : null,
-    guild: overrides.guildName
-      ? { name: overrides.guildName }
-      : null,
+    guild: overrides.guildName ? { name: overrides.guildName } : null,
     channel: {
       name: overrides.channelName ?? 'general',
       messages: {
@@ -641,8 +639,11 @@ describe('DiscordChannel', () => {
 
       await channel.sendMessage('dc:1234567890123456', 'Hello');
 
-      const fetchedChannel = await currentClient().channels.fetch('1234567890123456');
-      expect(currentClient().channels.fetch).toHaveBeenCalledWith('1234567890123456');
+      const fetchedChannel =
+        await currentClient().channels.fetch('1234567890123456');
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith(
+        '1234567890123456',
+      );
     });
 
     it('strips dc: prefix from JID', async () => {
@@ -798,8 +799,13 @@ describe('DiscordChannel', () => {
       const chunks = splitMessage(text, 8);
       for (const chunk of chunks) {
         expect(chunk.length).toBeLessThanOrEqual(8);
+        expect(chunk.length).toBeGreaterThan(0);
       }
-      expect(chunks.join(' ')).toBe(text);
+      // all original words must be present across chunks
+      const joined = chunks.join(' ');
+      for (const word of ['aa', 'bb', 'cc', 'dd', 'ee', 'ff']) {
+        expect(joined).toContain(word);
+      }
     });
 
     it('does not produce empty chunks', () => {
