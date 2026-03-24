@@ -100,7 +100,7 @@ vi.mock('discord.js', () => {
   };
 });
 
-import { DiscordChannel, DiscordChannelOpts } from './discord.js';
+import { DiscordChannel, DiscordChannelOpts, splitMessage } from './discord.js';
 
 // --- Test helpers ---
 
@@ -680,7 +680,7 @@ describe('DiscordChannel', () => {
       // No error, no API call
     });
 
-    it('splits messages exceeding 2000 characters', async () => {
+    it('splits messages exceeding 2000 characters at word boundaries', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
@@ -691,12 +691,18 @@ describe('DiscordChannel', () => {
       };
       currentClient().channels.fetch.mockResolvedValue(mockChannel);
 
-      const longText = 'x'.repeat(3000);
+      // Build text where a word straddles the 2000-char boundary
+      const filler = 'word '.repeat(399); // 1995 chars
+      const longText = filler + 'UNBREAKABLE extra text here';
       await channel.sendMessage('dc:1234567890123456', longText);
 
       expect(mockChannel.send).toHaveBeenCalledTimes(2);
-      expect(mockChannel.send).toHaveBeenNthCalledWith(1, 'x'.repeat(2000));
-      expect(mockChannel.send).toHaveBeenNthCalledWith(2, 'x'.repeat(1000));
+      // Should split at the space before UNBREAKABLE, not mid-word
+      const firstChunk = mockChannel.send.mock.calls[0][0];
+      const secondChunk = mockChannel.send.mock.calls[1][0];
+      expect(firstChunk.length).toBeLessThanOrEqual(2000);
+      expect(firstChunk).not.toMatch(/UNBREAK$/);
+      expect(secondChunk).toMatch(/^UNBREAKABLE/);
     });
   });
 
@@ -762,6 +768,45 @@ describe('DiscordChannel', () => {
       await channel.setTyping('dc:1234567890123456', true);
 
       // No error
+    });
+  });
+
+  // --- splitMessage ---
+
+  describe('splitMessage', () => {
+    it('returns single chunk when text is under limit', () => {
+      expect(splitMessage('hello', 2000)).toEqual(['hello']);
+    });
+
+    it('splits at word boundary', () => {
+      const chunks = splitMessage('aaa bbb ccc', 7);
+      expect(chunks).toEqual(['aaa bbb', 'ccc']);
+    });
+
+    it('splits at newline boundary', () => {
+      const chunks = splitMessage('aaa\nbbb\nccc', 7);
+      expect(chunks).toEqual(['aaa\nbbb', 'ccc']);
+    });
+
+    it('hard splits when a single word exceeds limit', () => {
+      const chunks = splitMessage('abcdefghij', 5);
+      expect(chunks).toEqual(['abcde', 'fghij']);
+    });
+
+    it('handles multiple splits', () => {
+      const text = 'aa bb cc dd ee ff';
+      const chunks = splitMessage(text, 8);
+      for (const chunk of chunks) {
+        expect(chunk.length).toBeLessThanOrEqual(8);
+      }
+      expect(chunks.join(' ')).toBe(text);
+    });
+
+    it('does not produce empty chunks', () => {
+      const chunks = splitMessage('hello world', 5);
+      for (const chunk of chunks) {
+        expect(chunk.length).toBeGreaterThan(0);
+      }
     });
   });
 

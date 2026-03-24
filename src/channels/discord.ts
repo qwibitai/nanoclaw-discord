@@ -194,13 +194,9 @@ export class DiscordChannel implements Channel {
       const textChannel = channel as TextChannel;
 
       // Discord has a 2000 character limit per message — split if needed
-      const MAX_LENGTH = 2000;
-      if (text.length <= MAX_LENGTH) {
-        await textChannel.send(text);
-      } else {
-        for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await textChannel.send(text.slice(i, i + MAX_LENGTH));
-        }
+      const chunks = splitMessage(text, 2000);
+      for (const chunk of chunks) {
+        await textChannel.send(chunk);
       }
       logger.info({ jid, length: text.length }, 'Discord message sent');
     } catch (err) {
@@ -236,6 +232,30 @@ export class DiscordChannel implements Channel {
       logger.debug({ jid, err }, 'Failed to send Discord typing indicator');
     }
   }
+}
+
+/**
+ * Split text into chunks that respect word boundaries.
+ * Falls back to hard split only when a single word exceeds maxLength.
+ */
+export function splitMessage(text: string, maxLength: number): string[] {
+  if (text.length <= maxLength) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLength) {
+      chunks.push(remaining);
+      break;
+    }
+    // Find last newline or space before the limit
+    let splitAt = remaining.lastIndexOf('\n', maxLength);
+    if (splitAt <= 0) splitAt = remaining.lastIndexOf(' ', maxLength);
+    if (splitAt <= 0) splitAt = maxLength; // no word boundary — hard cut
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).replace(/^[\n ]/, '');
+  }
+  return chunks;
 }
 
 registerChannel('discord', (opts: ChannelOpts) => {
