@@ -67,6 +67,20 @@ export const TRIGGER_PATTERN = new RegExp(
   'i',
 );
 
+// Discord guild IDs that auto-register channels on first message.
+// Comma-separated list of guild IDs, e.g., "123456789,987654321"
+const autoRegisterEnv = readEnvFile(['DISCORD_AUTO_REGISTER_GUILDS']);
+export const DISCORD_AUTO_REGISTER_GUILDS = new Set(
+  (
+    process.env.DISCORD_AUTO_REGISTER_GUILDS ||
+    autoRegisterEnv.DISCORD_AUTO_REGISTER_GUILDS ||
+    ''
+  )
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
 export const TIMEZONE =
