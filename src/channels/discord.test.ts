@@ -44,6 +44,11 @@ vi.mock('discord.js', () => {
     DirectMessages: 8,
   };
 
+  const Partials = {
+    Channel: 0,
+    Message: 1,
+  };
+
   class MockClient {
     eventHandlers = new Map<string, Handler[]>();
     user: any = { id: '999888777', tag: 'Andy#1234' };
@@ -96,6 +101,7 @@ vi.mock('discord.js', () => {
     Client: MockClient,
     Events,
     GatewayIntentBits,
+    Partials,
     TextChannel,
   };
 });
@@ -188,6 +194,39 @@ function currentClient() {
 async function triggerMessage(message: any) {
   const handlers = currentClient().eventHandlers.get('messageCreate') || [];
   for (const h of handlers) await h(message);
+}
+
+async function triggerRawDM(overrides: {
+  channelId?: string;
+  content?: string;
+  authorId?: string;
+  authorUsername?: string;
+  authorGlobalName?: string;
+  authorBot?: boolean;
+  messageId?: string;
+  timestamp?: string;
+  attachments?: any[];
+}) {
+  const packet = {
+    t: 'MESSAGE_CREATE',
+    d: {
+      channel_id: overrides.channelId ?? '1234567890123456',
+      id: overrides.messageId ?? 'msg_dm_001',
+      content: overrides.content ?? 'Hello from DM',
+      timestamp: overrides.timestamp ?? '2024-01-01T00:00:00.000Z',
+      author: {
+        id: overrides.authorId ?? '55512345',
+        username: overrides.authorUsername ?? 'alice',
+        global_name: overrides.authorGlobalName ?? 'Alice',
+        bot: overrides.authorBot,
+      },
+      guild_id: undefined,
+      channel_type: 1,
+      attachments: overrides.attachments ?? [],
+    },
+  };
+  const handlers = currentClient().eventHandlers.get('raw') || [];
+  for (const h of handlers) await h(packet);
 }
 
 // --- Tests ---
@@ -364,12 +403,10 @@ describe('DiscordChannel', () => {
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
 
-      const msg = createMessage({
+      await triggerRawDM({
         content: 'Hello',
-        guildName: undefined,
-        authorDisplayName: 'Alice',
+        authorGlobalName: 'Alice',
       });
-      await triggerMessage(msg);
 
       expect(opts.onChatMetadata).toHaveBeenCalledWith(
         'dc:1234567890123456',

@@ -1,4 +1,11 @@
-import { Client, Events, GatewayIntentBits, Message, TextChannel } from 'discord.js';
+import {
+  Client,
+  Events,
+  GatewayIntentBits,
+  Message,
+  Partials,
+  TextChannel,
+} from 'discord.js';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
@@ -37,11 +44,84 @@ export class DiscordChannel implements Channel {
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.DirectMessages,
       ],
+      partials: [Partials.Channel, Partials.Message],
+    });
+
+    // Handle DMs via raw gateway events.
+    // discord.js v14 does not reliably emit messageCreate for DMs even with
+    // Partials.Channel enabled — the raw gateway event is the only reliable
+    // source. Guild messages still go through messageCreate below.
+    this.client.on('raw' as any, (packet: any) => {
+      if (packet.t !== 'MESSAGE_CREATE' || packet.d.guild_id) return;
+
+      const d = packet.d;
+      if (d.author?.bot) return;
+
+      const channelId = d.channel_id;
+      const chatJid = `dc:${channelId}`;
+      const senderName = d.author?.global_name || d.author?.username || 'Unknown';
+      const sender = d.author?.id || '';
+      const msgId = d.id;
+      const timestamp = d.timestamp || new Date().toISOString();
+      let content = d.content || '';
+
+      // Translate @bot mentions into trigger format
+      const botId = this.client?.user?.id;
+      if (botId) {
+        const isBotMentioned =
+          content.includes(`<@${botId}>`) ||
+          content.includes(`<@!${botId}>`);
+        if (isBotMentioned) {
+          content = content.replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim();
+          if (!TRIGGER_PATTERN.test(content)) {
+            content = `@${ASSISTANT_NAME} ${content}`;
+          }
+        }
+      }
+
+      // Handle attachments
+      if (d.attachments?.length > 0) {
+        const descriptions = d.attachments.map((att: any) => {
+          const ct = att.content_type || '';
+          if (ct.startsWith('image/')) return `[Image: ${att.filename || 'image'}]`;
+          if (ct.startsWith('video/')) return `[Video: ${att.filename || 'video'}]`;
+          if (ct.startsWith('audio/')) return `[Audio: ${att.filename || 'audio'}]`;
+          return `[File: ${att.filename || 'file'}]`;
+        });
+        content = content
+          ? `${content}\n${descriptions.join('\n')}`
+          : descriptions.join('\n');
+      }
+
+      // Store chat metadata
+      this.opts.onChatMetadata(chatJid, timestamp, senderName, 'discord', false);
+
+      // Only deliver for registered groups
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) {
+        logger.debug({ chatJid, chatName: senderName }, 'DM from unregistered Discord channel');
+        return;
+      }
+
+      this.opts.onMessage(chatJid, {
+        id: msgId,
+        chat_jid: chatJid,
+        sender,
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+
+      logger.info({ chatJid, chatName: senderName, sender: senderName }, 'Discord DM stored');
     });
 
     this.client.on(Events.MessageCreate, async (message: Message) => {
       // Ignore bot messages (including own)
       if (message.author.bot) return;
+
+      // Skip DMs — handled by the raw event listener above
+      if (!message.guild) return;
 
       const channelId = message.channelId;
       const chatJid = `dc:${channelId}`;
@@ -55,13 +135,8 @@ export class DiscordChannel implements Channel {
       const msgId = message.id;
 
       // Determine chat name
-      let chatName: string;
-      if (message.guild) {
-        const textChannel = message.channel as TextChannel;
-        chatName = `${message.guild.name} #${textChannel.name}`;
-      } else {
-        chatName = senderName;
-      }
+      const textChannel = message.channel as TextChannel;
+      const chatName = `${message.guild.name} #${textChannel.name}`;
 
       // Translate Discord @bot mentions into TRIGGER_PATTERN format.
       // Discord mentions look like <@botUserId> — these won't match
@@ -88,18 +163,20 @@ export class DiscordChannel implements Channel {
 
       // Handle attachments — store placeholders so the agent knows something was sent
       if (message.attachments.size > 0) {
-        const attachmentDescriptions = [...message.attachments.values()].map((att) => {
-          const contentType = att.contentType || '';
-          if (contentType.startsWith('image/')) {
-            return `[Image: ${att.name || 'image'}]`;
-          } else if (contentType.startsWith('video/')) {
-            return `[Video: ${att.name || 'video'}]`;
-          } else if (contentType.startsWith('audio/')) {
-            return `[Audio: ${att.name || 'audio'}]`;
-          } else {
-            return `[File: ${att.name || 'file'}]`;
-          }
-        });
+        const attachmentDescriptions = [...message.attachments.values()].map(
+          (att) => {
+            const contentType = att.contentType || '';
+            if (contentType.startsWith('image/')) {
+              return `[Image: ${att.name || 'image'}]`;
+            } else if (contentType.startsWith('video/')) {
+              return `[Video: ${att.name || 'video'}]`;
+            } else if (contentType.startsWith('audio/')) {
+              return `[Audio: ${att.name || 'audio'}]`;
+            } else {
+              return `[File: ${att.name || 'file'}]`;
+            }
+          },
+        );
         if (content) {
           content = `${content}\n${attachmentDescriptions.join('\n')}`;
         } else {
@@ -124,8 +201,7 @@ export class DiscordChannel implements Channel {
       }
 
       // Store chat metadata for discovery
-      const isGroup = message.guild !== null;
-      this.opts.onChatMetadata(chatJid, timestamp, chatName, 'discord', isGroup);
+      this.opts.onChatMetadata(chatJid, timestamp, chatName, 'discord', true);
 
       // Only deliver full message for registered groups
       const group = this.opts.registeredGroups()[chatJid];
