@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach, beforeAll, afterAll } from 'vitest';
 
 // --- Mocks ---
 
@@ -12,6 +12,10 @@ vi.mock('../env.js', () => ({ readEnvFile: vi.fn(() => ({})) }));
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
   TRIGGER_PATTERN: /^@Andy\b/i,
+  buildTriggerPattern: (trigger: string) => {
+    const escaped = trigger.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`^${escaped}\\b`, 'i');
+  },
 }));
 
 // Mock logger
@@ -161,9 +165,7 @@ function createMessage(overrides: {
     member: overrides.memberDisplayName
       ? { displayName: overrides.memberDisplayName }
       : null,
-    guild: overrides.guildName
-      ? { name: overrides.guildName }
-      : null,
+    guild: overrides.guildName ? { name: overrides.guildName } : null,
     channel: {
       name: overrides.channelName ?? 'general',
       messages: {
@@ -641,8 +643,11 @@ describe('DiscordChannel', () => {
 
       await channel.sendMessage('dc:1234567890123456', 'Hello');
 
-      const fetchedChannel = await currentClient().channels.fetch('1234567890123456');
-      expect(currentClient().channels.fetch).toHaveBeenCalledWith('1234567890123456');
+      const fetchedChannel =
+        await currentClient().channels.fetch('1234567890123456');
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith(
+        '1234567890123456',
+      );
     });
 
     it('strips dc: prefix from JID', async () => {
@@ -772,5 +777,78 @@ describe('DiscordChannel', () => {
       const channel = new DiscordChannel('test-token', createTestOpts());
       expect(channel.name).toBe('discord');
     });
+
+    it('uses custom jidPrefix and triggerName from options', () => {
+      const channel = new DiscordChannel('test-token', createTestOpts(), {
+        jidPrefix: 'dc-eng',
+        label: 'engineer',
+        triggerName: 'Engineer',
+      });
+      expect(channel.name).toBe('discord');
+      expect(channel.ownsJid('dc-eng:12345')).toBe(true);
+      expect(channel.ownsJid('dc:12345')).toBe(false);
+    });
+  });
+});
+
+// --- parseDiscordBots ---
+
+describe('parseDiscordBots', () => {
+  let parseDiscordBots: typeof import('./discord.js').parseDiscordBots;
+
+  beforeAll(async () => {
+    const mod = await import('./discord.js');
+    parseDiscordBots = mod.parseDiscordBots;
+  });
+
+  it('parses valid entries', () => {
+    const result = parseDiscordBots('eng:TOKEN1:Engineer;ops:TOKEN2:Ops');
+    expect(result).toEqual([
+      { name: 'eng', token: 'TOKEN1', triggerName: 'Engineer' },
+      { name: 'ops', token: 'TOKEN2', triggerName: 'Ops' },
+    ]);
+  });
+
+  it('returns empty array for empty string', () => {
+    expect(parseDiscordBots('')).toEqual([]);
+    expect(parseDiscordBots('  ')).toEqual([]);
+  });
+
+  it('skips entries with wrong number of parts', () => {
+    const result = parseDiscordBots('bad-entry;eng:TOKEN1:Engineer');
+    expect(result).toEqual([
+      { name: 'eng', token: 'TOKEN1', triggerName: 'Engineer' },
+    ]);
+  });
+
+  it('rejects entries with more than 3 colon-delimited parts', () => {
+    const result = parseDiscordBots('eng:TOK:EN:Engineer');
+    expect(result).toEqual([]);
+  });
+
+  it('skips entries with empty fields', () => {
+    expect(parseDiscordBots(':TOKEN:Eng')).toEqual([]);
+    expect(parseDiscordBots('eng::Eng')).toEqual([]);
+    expect(parseDiscordBots('eng:TOKEN:')).toEqual([]);
+  });
+
+  it('rejects names with invalid characters', () => {
+    expect(parseDiscordBots('bot.ops:TOKEN:Ops')).toEqual([]);
+    expect(parseDiscordBots('bot+dev:TOKEN:Dev')).toEqual([]);
+    expect(parseDiscordBots('bot ops:TOKEN:Ops')).toEqual([]);
+  });
+
+  it('accepts hyphenated names', () => {
+    const result = parseDiscordBots('my-bot:TOKEN:MyBot');
+    expect(result).toEqual([
+      { name: 'my-bot', token: 'TOKEN', triggerName: 'MyBot' },
+    ]);
+  });
+
+  it('handles trailing semicolons and whitespace', () => {
+    const result = parseDiscordBots(' eng : TOKEN1 : Engineer ; ; ');
+    expect(result).toEqual([
+      { name: 'eng', token: 'TOKEN1', triggerName: 'Engineer' },
+    ]);
   });
 });
