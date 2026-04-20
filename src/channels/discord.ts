@@ -1,7 +1,17 @@
-import { Client, Events, GatewayIntentBits, Message, TextChannel } from 'discord.js';
+import fs from 'fs';
+import path from 'path';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import {
+  Client,
+  Events,
+  GatewayIntentBits,
+  Message,
+  TextChannel,
+} from 'discord.js';
+
+import { ASSISTANT_NAME, TRIGGER_PATTERN, GROUPS_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
+import { processImage } from '../image.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
@@ -86,20 +96,111 @@ export class DiscordChannel implements Channel {
         }
       }
 
-      // Handle attachments — store placeholders so the agent knows something was sent
+      // Store chat metadata for discovery
+      const isGroup = message.guild !== null;
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        chatName,
+        'discord',
+        isGroup,
+      );
+
+      // Look up registered group early — needed for attachment saving
+      const group = this.opts.registeredGroups()[chatJid];
+
+      // Handle attachments — download and save files so the agent can access them
       if (message.attachments.size > 0) {
-        const attachmentDescriptions = [...message.attachments.values()].map((att) => {
+        const attachmentDescriptions: string[] = [];
+
+        for (const att of message.attachments.values()) {
           const contentType = att.contentType || '';
-          if (contentType.startsWith('image/')) {
-            return `[Image: ${att.name || 'image'}]`;
-          } else if (contentType.startsWith('video/')) {
-            return `[Video: ${att.name || 'video'}]`;
-          } else if (contentType.startsWith('audio/')) {
-            return `[Audio: ${att.name || 'audio'}]`;
-          } else {
-            return `[File: ${att.name || 'file'}]`;
+
+          try {
+            if (contentType.startsWith('image/') && group) {
+              // Download image and save via processImage (resizes, saves as JPEG)
+              const response = await fetch(att.url);
+              const arrayBuffer = await response.arrayBuffer();
+              const buffer = Buffer.from(arrayBuffer);
+              const groupDir = path.join(GROUPS_DIR, group.folder);
+              const caption = att.description || '';
+              const result = await processImage(buffer, groupDir, caption);
+              if (result) {
+                attachmentDescriptions.push(result.content);
+              } else {
+                attachmentDescriptions.push(`[Image: ${att.name || 'image'}]`);
+              }
+            } else if (
+              (contentType.startsWith('video/') ||
+                contentType.startsWith('audio/') ||
+                contentType === 'application/pdf' ||
+                contentType.startsWith('application/') ||
+                contentType.startsWith('text/')) &&
+              group
+            ) {
+              // Download and save non-image files to attachments dir
+              const response = await fetch(att.url);
+              const arrayBuffer = await response.arrayBuffer();
+              const buffer = Buffer.from(arrayBuffer);
+              const groupDir = path.join(GROUPS_DIR, group.folder);
+              const attachDir = path.join(groupDir, 'attachments');
+              fs.mkdirSync(attachDir, { recursive: true });
+
+              // Sanitize filename
+              const safeName = (att.name || 'file').replace(
+                /[^a-zA-Z0-9._-]/g,
+                '_',
+              );
+              const filename = `${Date.now()}-${safeName}`;
+              const filePath = path.join(attachDir, filename);
+              fs.writeFileSync(filePath, buffer);
+
+              const relativePath = `attachments/${filename}`;
+              if (contentType.startsWith('video/')) {
+                attachmentDescriptions.push(`[Video: ${relativePath}]`);
+              } else if (contentType.startsWith('audio/')) {
+                attachmentDescriptions.push(`[Audio: ${relativePath}]`);
+              } else if (contentType === 'application/pdf') {
+                attachmentDescriptions.push(`[PDF: ${relativePath}]`);
+              } else {
+                attachmentDescriptions.push(`[File: ${relativePath}]`);
+              }
+            } else {
+              // No group registered or unknown type — fall back to placeholder
+              if (contentType.startsWith('image/')) {
+                attachmentDescriptions.push(
+                  `[Image: ${att.name || 'image'}]`,
+                );
+              } else if (contentType.startsWith('video/')) {
+                attachmentDescriptions.push(
+                  `[Video: ${att.name || 'video'}]`,
+                );
+              } else if (contentType.startsWith('audio/')) {
+                attachmentDescriptions.push(
+                  `[Audio: ${att.name || 'audio'}]`,
+                );
+              } else {
+                attachmentDescriptions.push(`[File: ${att.name || 'file'}]`);
+              }
+            }
+          } catch (err) {
+            logger.warn(
+              { attName: att.name, err },
+              'Failed to download Discord attachment',
+            );
+            // Fall back to placeholder on download error
+            if (contentType.startsWith('image/')) {
+              attachmentDescriptions.push(`[Image: ${att.name || 'image'}]`);
+            } else if (contentType.startsWith('video/')) {
+              attachmentDescriptions.push(`[Video: ${att.name || 'video'}]`);
+            } else if (contentType.startsWith('audio/')) {
+              attachmentDescriptions.push(`[Audio: ${att.name || 'audio'}]`);
+            } else {
+              attachmentDescriptions.push(`[File: ${att.name || 'file'}]`);
+            }
           }
-        });
+        }
+
         if (content) {
           content = `${content}\n${attachmentDescriptions.join('\n')}`;
         } else {
@@ -123,12 +224,7 @@ export class DiscordChannel implements Channel {
         }
       }
 
-      // Store chat metadata for discovery
-      const isGroup = message.guild !== null;
-      this.opts.onChatMetadata(chatJid, timestamp, chatName, 'discord', isGroup);
-
       // Only deliver full message for registered groups
-      const group = this.opts.registeredGroups()[chatJid];
       if (!group) {
         logger.debug(
           { chatJid, chatName },
