@@ -1,4 +1,14 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  vi,
+  afterEach,
+  beforeAll,
+} from 'vitest';
+import fs from 'fs/promises';
+import path from 'path';
 
 // --- Mocks ---
 
@@ -12,6 +22,11 @@ vi.mock('../env.js', () => ({ readEnvFile: vi.fn(() => ({})) }));
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
   TRIGGER_PATTERN: /^@Andy\b/i,
+  GROUPS_DIR: testGroupsDir,
+  buildTriggerPattern: (trigger: string) => {
+    const escaped = trigger.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`^${escaped}\\b`, 'i');
+  },
 }));
 
 // Mock logger
@@ -29,6 +44,7 @@ vi.mock('../logger.js', () => ({
 type Handler = (...args: any[]) => any;
 
 const clientRef = vi.hoisted(() => ({ current: null as any }));
+const testGroupsDir = vi.hoisted(() => '/tmp/nanoclaw-discord-test-groups');
 
 vi.mock('discord.js', () => {
   const Events = {
@@ -42,6 +58,11 @@ vi.mock('discord.js', () => {
     GuildMessages: 2,
     MessageContent: 4,
     DirectMessages: 8,
+  };
+
+  const Partials = {
+    Channel: 0,
+    Message: 1,
   };
 
   class MockClient {
@@ -81,6 +102,11 @@ vi.mock('discord.js', () => {
       fetch: vi.fn().mockResolvedValue({
         send: vi.fn().mockResolvedValue(undefined),
         sendTyping: vi.fn().mockResolvedValue(undefined),
+        messages: {
+          fetch: vi.fn().mockResolvedValue({
+            author: { username: 'Andy', displayName: 'Andy' },
+          }),
+        },
       }),
     };
 
@@ -96,6 +122,7 @@ vi.mock('discord.js', () => {
     Client: MockClient,
     Events,
     GatewayIntentBits,
+    Partials,
     TextChannel,
   };
 });
@@ -161,9 +188,7 @@ function createMessage(overrides: {
     member: overrides.memberDisplayName
       ? { displayName: overrides.memberDisplayName }
       : null,
-    guild: overrides.guildName
-      ? { name: overrides.guildName }
-      : null,
+    guild: overrides.guildName ? { name: overrides.guildName } : null,
     channel: {
       name: overrides.channelName ?? 'general',
       messages: {
@@ -190,15 +215,61 @@ async function triggerMessage(message: any) {
   for (const h of handlers) await h(message);
 }
 
+async function triggerRawDM(overrides: {
+  channelId?: string;
+  content?: string;
+  authorId?: string;
+  authorUsername?: string;
+  authorGlobalName?: string;
+  authorBot?: boolean;
+  messageId?: string;
+  timestamp?: string;
+  attachments?: any[];
+  messageReference?: { message_id?: string };
+}) {
+  const packet = {
+    t: 'MESSAGE_CREATE',
+    d: {
+      channel_id: overrides.channelId ?? '1234567890123456',
+      id: overrides.messageId ?? 'msg_dm_001',
+      content: overrides.content ?? 'Hello from DM',
+      timestamp: overrides.timestamp ?? '2024-01-01T00:00:00.000Z',
+      author: {
+        id: overrides.authorId ?? '55512345',
+        username: overrides.authorUsername ?? 'alice',
+        global_name: overrides.authorGlobalName ?? 'Alice',
+        bot: overrides.authorBot,
+      },
+      guild_id: undefined,
+      channel_type: 1,
+      attachments: overrides.attachments ?? [],
+      message_reference: overrides.messageReference,
+    },
+  };
+  const handlers = currentClient().eventHandlers.get('raw') || [];
+  for (const h of handlers) await h(packet);
+}
+
 // --- Tests ---
 
 describe('DiscordChannel', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-length': '11' }),
+        arrayBuffer: async () => Buffer.from('hello world'),
+      })),
+    );
+    await fs.rm(testGroupsDir, { recursive: true, force: true });
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   // --- Connection lifecycle ---
@@ -364,12 +435,10 @@ describe('DiscordChannel', () => {
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
 
-      const msg = createMessage({
+      await triggerRawDM({
         content: 'Hello',
-        guildName: undefined,
-        authorDisplayName: 'Alice',
+        authorGlobalName: 'Alice',
       });
-      await triggerMessage(msg);
 
       expect(opts.onChatMetadata).toHaveBeenCalledWith(
         'dc:1234567890123456',
@@ -605,6 +674,64 @@ describe('DiscordChannel', () => {
         }),
       );
     });
+
+    it('downloads registered guild attachments into the group attachments folder', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const attachments = new Map([
+        [
+          'att1',
+          {
+            id: 'att1',
+            name: '../unsafe report.pdf',
+            contentType: 'application/pdf',
+            url: 'https://cdn.discordapp.com/report.pdf',
+            size: 11,
+          },
+        ],
+      ]);
+      await triggerMessage(
+        createMessage({ content: '', attachments, guildName: 'Server' }),
+      );
+
+      const savedRelative = 'attachments/1700000000000-att1-unsafe_report.pdf';
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: `[PDF: ${savedRelative}]` }),
+      );
+      await expect(
+        fs.readFile(
+          path.join(testGroupsDir, 'test-server', savedRelative),
+          'utf8',
+        ),
+      ).resolves.toBe('hello world');
+    });
+
+    it('does not download attachments for unregistered guild channels', async () => {
+      const opts = createTestOpts({ registeredGroups: vi.fn(() => ({})) });
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const attachments = new Map([
+        [
+          'att1',
+          {
+            name: 'photo.png',
+            contentType: 'image/png',
+            url: 'https://cdn.discordapp.com/photo.png',
+          },
+        ],
+      ]);
+      await triggerMessage(
+        createMessage({ content: '', attachments, guildName: 'Server' }),
+      );
+
+      expect(global.fetch).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
   });
 
   // --- Reply context ---
@@ -631,6 +758,210 @@ describe('DiscordChannel', () => {
     });
   });
 
+  // --- Raw DM gateway handling ---
+  describe('raw DM gateway handling', () => {
+    it('delivers a DM exactly once when raw and high-level events both fire', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({ content: 'same dm', messageId: 'dm_once' });
+      await triggerMessage(
+        createMessage({ content: 'same dm', messageId: 'dm_once' }),
+      );
+
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ id: 'dm_once', content: 'same dm' }),
+      );
+    });
+
+    it('ignores bot-authored raw DMs', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({ authorBot: true, content: 'bot dm' });
+
+      expect(opts.onChatMetadata).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+
+    it('delivers raw DM ids, sender, timestamp, JID, metadata, and text content', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({
+        channelId: '1234567890123456',
+        content: 'plain dm',
+        authorId: 'user_123',
+        authorUsername: 'alice_user',
+        authorGlobalName: 'Alice Global',
+        messageId: 'dm_text_1',
+        timestamp: '2024-02-03T04:05:06.000Z',
+      });
+
+      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        '2024-02-03T04:05:06.000Z',
+        'Alice Global',
+        'discord',
+        false,
+      );
+      expect(opts.onMessage).toHaveBeenCalledWith('dc:1234567890123456', {
+        id: 'dm_text_1',
+        chat_jid: 'dc:1234567890123456',
+        sender: 'user_123',
+        sender_name: 'Alice Global',
+        content: 'plain dm',
+        timestamp: '2024-02-03T04:05:06.000Z',
+        is_from_me: false,
+      });
+    });
+
+    it('handles attachment-only raw DMs deterministically', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({
+        content: '',
+        attachments: [
+          { filename: 'photo.png', content_type: 'image/png' },
+          { filename: 'clip.mp4', content_type: 'video/mp4' },
+          { filename: 'note.txt', content_type: 'text/plain' },
+        ],
+      });
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({
+          content: '[Image: photo.png]\n[Video: clip.mp4]\n[File: note.txt]',
+        }),
+      );
+    });
+
+    it('downloads registered raw DM attachments through the shared attachment path', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_001);
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({
+        content: '',
+        attachments: [
+          {
+            id: 'dm1',
+            filename: 'photo.png',
+            content_type: 'image/png',
+            url: 'https://cdn.discordapp.com/photo.png',
+            size: 11,
+          },
+        ],
+      });
+
+      const savedRelative = 'attachments/1700000000001-dm1-photo.png';
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: `[Image: ${savedRelative}]` }),
+      );
+      await expect(
+        fs.readFile(
+          path.join(testGroupsDir, 'test-server', savedRelative),
+          'utf8',
+        ),
+      ).resolves.toBe('hello world');
+    });
+
+    it('handles empty raw DMs deterministically', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({ content: '', attachments: [] });
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: '' }),
+      );
+    });
+
+    it('translates raw DM bot mentions like guild messages', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({ content: '<@!999888777> check this' });
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: '@Andy check this' }),
+      );
+    });
+
+    it('adds raw DM reply context like guild messages', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({
+        content: 'yes',
+        messageReference: { message_id: 'bot_reply_1' },
+      });
+
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith(
+        '1234567890123456',
+      );
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: '[Reply to Andy] yes' }),
+      );
+    });
+
+    it('does not process unregistered raw DMs', async () => {
+      const opts = createTestOpts({ registeredGroups: vi.fn(() => ({})) });
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({ content: '@Andy hello' });
+
+      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.any(String),
+        'Alice',
+        'discord',
+        false,
+      );
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+
+    it('ignores raw guild messages so guild message handling is unchanged', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const rawHandlers = currentClient().eventHandlers.get('raw') || [];
+      for (const h of rawHandlers) {
+        await h({
+          t: 'MESSAGE_CREATE',
+          d: { guild_id: 'guild_1', channel_id: '1234567890123456' },
+        });
+      }
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      await triggerMessage(
+        createMessage({ content: 'guild ok', guildName: 'Server' }),
+      );
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: 'guild ok' }),
+      );
+    });
+  });
+
   // --- sendMessage ---
 
   describe('sendMessage', () => {
@@ -641,8 +972,9 @@ describe('DiscordChannel', () => {
 
       await channel.sendMessage('dc:1234567890123456', 'Hello');
 
-      const fetchedChannel = await currentClient().channels.fetch('1234567890123456');
-      expect(currentClient().channels.fetch).toHaveBeenCalledWith('1234567890123456');
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith(
+        '1234567890123456',
+      );
     });
 
     it('strips dc: prefix from JID', async () => {
@@ -772,5 +1104,78 @@ describe('DiscordChannel', () => {
       const channel = new DiscordChannel('test-token', createTestOpts());
       expect(channel.name).toBe('discord');
     });
+
+    it('uses custom jidPrefix and triggerName from options', () => {
+      const channel = new DiscordChannel('test-token', createTestOpts(), {
+        jidPrefix: 'dc-eng',
+        label: 'engineer',
+        triggerName: 'Engineer',
+      });
+      expect(channel.name).toBe('discord');
+      expect(channel.ownsJid('dc-eng:12345')).toBe(true);
+      expect(channel.ownsJid('dc:12345')).toBe(false);
+    });
+  });
+});
+
+// --- parseDiscordBots ---
+
+describe('parseDiscordBots', () => {
+  let parseDiscordBots: typeof import('./discord.js').parseDiscordBots;
+
+  beforeAll(async () => {
+    const mod = await import('./discord.js');
+    parseDiscordBots = mod.parseDiscordBots;
+  });
+
+  it('parses valid entries', () => {
+    const result = parseDiscordBots('eng:TOKEN1:Engineer;ops:TOKEN2:Ops');
+    expect(result).toEqual([
+      { name: 'eng', token: 'TOKEN1', triggerName: 'Engineer' },
+      { name: 'ops', token: 'TOKEN2', triggerName: 'Ops' },
+    ]);
+  });
+
+  it('returns empty array for empty string', () => {
+    expect(parseDiscordBots('')).toEqual([]);
+    expect(parseDiscordBots('  ')).toEqual([]);
+  });
+
+  it('skips entries with wrong number of parts', () => {
+    const result = parseDiscordBots('bad-entry;eng:TOKEN1:Engineer');
+    expect(result).toEqual([
+      { name: 'eng', token: 'TOKEN1', triggerName: 'Engineer' },
+    ]);
+  });
+
+  it('rejects entries with more than 3 colon-delimited parts', () => {
+    const result = parseDiscordBots('eng:TOK:EN:Engineer');
+    expect(result).toEqual([]);
+  });
+
+  it('skips entries with empty fields', () => {
+    expect(parseDiscordBots(':TOKEN:Eng')).toEqual([]);
+    expect(parseDiscordBots('eng::Eng')).toEqual([]);
+    expect(parseDiscordBots('eng:TOKEN:')).toEqual([]);
+  });
+
+  it('rejects names with invalid characters', () => {
+    expect(parseDiscordBots('bot.ops:TOKEN:Ops')).toEqual([]);
+    expect(parseDiscordBots('bot+dev:TOKEN:Dev')).toEqual([]);
+    expect(parseDiscordBots('bot ops:TOKEN:Ops')).toEqual([]);
+  });
+
+  it('accepts hyphenated names', () => {
+    const result = parseDiscordBots('my-bot:TOKEN:MyBot');
+    expect(result).toEqual([
+      { name: 'my-bot', token: 'TOKEN', triggerName: 'MyBot' },
+    ]);
+  });
+
+  it('handles trailing semicolons and whitespace', () => {
+    const result = parseDiscordBots(' eng : TOKEN1 : Engineer ; ; ');
+    expect(result).toEqual([
+      { name: 'eng', token: 'TOKEN1', triggerName: 'Engineer' },
+    ]);
   });
 });
