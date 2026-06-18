@@ -572,15 +572,16 @@ export function parseDiscordBots(raw?: string): DiscordBotConfig[] {
   if (!value.trim()) return [];
 
   const bots: DiscordBotConfig[] = [];
-  for (const entry of value.split(';')) {
-    const trimmed = entry.trim();
+  const entries = value.split(';');
+  for (let index = 0; index < entries.length; index += 1) {
+    const trimmed = entries[index].trim();
     if (!trimmed) continue;
     // Format: name:token:triggerName — Discord tokens use alphanumeric + . - _
     // and do not contain colons, so exactly 3 colon-delimited parts are expected.
     const parts = trimmed.split(':');
     if (parts.length !== 3) {
       logger.warn(
-        { entry: trimmed },
+        { entryIndex: index, fieldCount: parts.length },
         'DISCORD_BOTS: skipping malformed entry (expected exactly name:token:triggerName)',
       );
       continue;
@@ -590,7 +591,12 @@ export function parseDiscordBots(raw?: string): DiscordBotConfig[] {
     const triggerName = parts[2].trim();
     if (!name || !token || !triggerName) {
       logger.warn(
-        { entry: trimmed },
+        {
+          entryIndex: index,
+          name: name || undefined,
+          hasToken: Boolean(token),
+          hasTriggerName: Boolean(triggerName),
+        },
         'DISCORD_BOTS: skipping entry with empty field',
       );
       continue;

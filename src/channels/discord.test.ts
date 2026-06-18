@@ -127,6 +127,7 @@ vi.mock('discord.js', () => {
   };
 });
 
+import { logger } from '../logger.js';
 import { DiscordChannel, DiscordChannelOpts } from './discord.js';
 
 // --- Test helpers ---
@@ -1177,5 +1178,15 @@ describe('parseDiscordBots', () => {
     expect(result).toEqual([
       { name: 'eng', token: 'TOKEN1', triggerName: 'Engineer' },
     ]);
+  });
+
+  it('does not log bot tokens when rejecting malformed entries', () => {
+    parseDiscordBots('eng:SECRET_TOKEN:Extra:Engineer;ops:OTHER_SECRET:');
+
+    const loggedPayloads = vi
+      .mocked(logger.warn)
+      .mock.calls.map((call) => JSON.stringify(call[0]));
+    expect(loggedPayloads.join('\n')).not.toContain('SECRET_TOKEN');
+    expect(loggedPayloads.join('\n')).not.toContain('OTHER_SECRET');
   });
 });
