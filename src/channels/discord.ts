@@ -23,6 +23,13 @@ import {
 
 const DISCORD_ATTACHMENT_TIMEOUT_MS = 15_000;
 const DISCORD_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+const DISCORD_ATTACHMENT_MAX_TOTAL_BYTES = 50 * 1024 * 1024;
+const DISCORD_ATTACHMENT_MAX_REDIRECTS = 3;
+const DISCORD_ATTACHMENT_HOSTS = new Set([
+  'cdn.discordapp.com',
+  'media.discordapp.net',
+  'attachments.discordapp.net',
+]);
 let attachmentSaveCounter = 0;
 
 interface DiscordAttachmentLike {
@@ -70,6 +77,28 @@ function ensureWithinBase(baseDir: string, targetPath: string): void {
   }
 }
 
+async function ensureRealPathWithinBase(
+  baseDir: string,
+  targetPath: string,
+): Promise<void> {
+  const [realBase, realTarget] = await Promise.all([
+    fs.realpath(baseDir),
+    fs.realpath(targetPath),
+  ]);
+  ensureWithinBase(realBase, realTarget);
+}
+
+function validateDiscordAttachmentUrl(rawUrl: string): URL {
+  const url = new URL(rawUrl);
+  if (url.protocol !== 'https:') {
+    throw new Error('Discord attachment URL must use HTTPS');
+  }
+  if (!DISCORD_ATTACHMENT_HOSTS.has(url.hostname.toLowerCase())) {
+    throw new Error(`Discord attachment host is not allowed: ${url.hostname}`);
+  }
+  return url;
+}
+
 function safeAttachmentFilename(att: DiscordAttachmentLike): string {
   const base = path
     .basename(attachmentName(att))
@@ -88,14 +117,38 @@ function safeAttachmentFilename(att: DiscordAttachmentLike): string {
   return `${prefix}-${safeBase}`;
 }
 
-async function downloadDiscordAttachment(
-  att: DiscordAttachmentLike,
-): Promise<Buffer> {
-  if (!att.url) throw new Error('Discord attachment is missing a URL');
-  if (att.size && att.size > DISCORD_ATTACHMENT_MAX_BYTES) {
-    throw new Error(
-      `Discord attachment exceeds ${DISCORD_ATTACHMENT_MAX_BYTES} bytes`,
+async function fetchDiscordAttachment(
+  url: URL,
+  signal: AbortSignal,
+  redirectsRemaining = DISCORD_ATTACHMENT_MAX_REDIRECTS,
+): Promise<Response> {
+  const response = await fetch(url, { redirect: 'manual', signal });
+  if ([301, 302, 303, 307, 308].includes(response.status)) {
+    if (redirectsRemaining <= 0) {
+      throw new Error('Discord attachment redirect limit exceeded');
+    }
+    const location = response.headers.get('location');
+    if (!location) {
+      throw new Error('Discord attachment redirect missing Location');
+    }
+    const nextUrl = validateDiscordAttachmentUrl(
+      new URL(location, url).toString(),
     );
+    return fetchDiscordAttachment(nextUrl, signal, redirectsRemaining - 1);
+  }
+  return response;
+}
+
+async function downloadDiscordAttachmentToFile(
+  att: DiscordAttachmentLike,
+  destPath: string,
+  remainingBytes: number,
+): Promise<number> {
+  if (!att.url) throw new Error('Discord attachment is missing a URL');
+  const url = validateDiscordAttachmentUrl(att.url);
+  const maxBytes = Math.min(DISCORD_ATTACHMENT_MAX_BYTES, remainingBytes);
+  if (maxBytes <= 0 || (att.size && att.size > maxBytes)) {
+    throw new Error(`Discord attachment exceeds ${maxBytes} remaining bytes`);
   }
 
   const controller = new AbortController();
@@ -103,8 +156,13 @@ async function downloadDiscordAttachment(
     () => controller.abort(),
     DISCORD_ATTACHMENT_TIMEOUT_MS,
   );
+  const partialPath = `${destPath}.part-${process.pid}-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  let written = 0;
   try {
-    const response = await fetch(att.url, { signal: controller.signal });
+    const response = await fetchDiscordAttachment(url, controller.signal);
     if (!response.ok) {
       throw new Error(
         `Discord attachment download failed: HTTP ${response.status}`,
@@ -112,51 +170,74 @@ async function downloadDiscordAttachment(
     }
 
     const contentLength = response.headers.get('content-length');
-    if (contentLength && Number(contentLength) > DISCORD_ATTACHMENT_MAX_BYTES) {
-      throw new Error(
-        `Discord attachment exceeds ${DISCORD_ATTACHMENT_MAX_BYTES} bytes`,
-      );
+    if (contentLength && Number(contentLength) > maxBytes) {
+      throw new Error(`Discord attachment exceeds ${maxBytes} remaining bytes`);
+    }
+    if (!response.body) {
+      throw new Error('Discord attachment response has no body');
     }
 
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (buffer.byteLength > DISCORD_ATTACHMENT_MAX_BYTES) {
-      throw new Error(
-        `Discord attachment exceeds ${DISCORD_ATTACHMENT_MAX_BYTES} bytes`,
-      );
+    handle = await fs.open(partialPath, 'wx');
+    const reader = response.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      written += value.byteLength;
+      if (written > maxBytes) {
+        controller.abort();
+        throw new Error(`Discord attachment exceeds ${maxBytes} remaining bytes`);
+      }
+      await handle.writeFile(value);
     }
-    return buffer;
+    await handle.close();
+    handle = undefined;
+    await fs.link(partialPath, destPath);
+    await fs.rm(partialPath, { force: true });
+    return written;
   } finally {
     clearTimeout(timeout);
+    await handle?.close().catch(() => undefined);
+    await fs.rm(partialPath, { force: true }).catch(() => undefined);
   }
 }
 
 async function saveDiscordAttachment(
   att: DiscordAttachmentLike,
   group: RegisteredGroup | undefined,
-): Promise<string> {
-  if (!group || !att.url) return attachmentPlaceholder(att);
+  remainingBytes: number,
+): Promise<{ description: string; bytesSaved: number }> {
+  if (!group || !att.url) {
+    return { description: attachmentPlaceholder(att), bytesSaved: 0 };
+  }
 
   try {
     const groupDir = path.resolve(GROUPS_DIR, group.folder);
     ensureWithinBase(path.resolve(GROUPS_DIR), groupDir);
     const attachDir = path.resolve(groupDir, 'attachments');
     ensureWithinBase(groupDir, attachDir);
-
-    const buffer = await downloadDiscordAttachment(att);
     await fs.mkdir(attachDir, { recursive: true });
+    await ensureRealPathWithinBase(path.resolve(GROUPS_DIR), groupDir);
+    await ensureRealPathWithinBase(groupDir, attachDir);
 
     const filename = safeAttachmentFilename(att);
     const filePath = path.resolve(attachDir, filename);
     ensureWithinBase(attachDir, filePath);
-    await fs.writeFile(filePath, buffer, { flag: 'wx' });
+    const bytesSaved = await downloadDiscordAttachmentToFile(
+      att,
+      filePath,
+      remainingBytes,
+    );
 
-    return `[${attachmentKind(attachmentContentType(att))}: attachments/${filename}]`;
+    return {
+      description: `[${attachmentKind(attachmentContentType(att))}: attachments/${filename}]`,
+      bytesSaved,
+    };
   } catch (err) {
     logger.warn(
       { attName: attachmentName(att), err },
       'Failed to download Discord attachment',
     );
-    return attachmentPlaceholder(att);
+    return { description: attachmentPlaceholder(att), bytesSaved: 0 };
   }
 }
 
@@ -165,8 +246,11 @@ async function describeDiscordAttachments(
   group: RegisteredGroup | undefined,
 ): Promise<string[]> {
   const descriptions: string[] = [];
+  let remainingBytes = DISCORD_ATTACHMENT_MAX_TOTAL_BYTES;
   for (const att of attachments) {
-    descriptions.push(await saveDiscordAttachment(att, group));
+    const saved = await saveDiscordAttachment(att, group, remainingBytes);
+    remainingBytes -= saved.bytesSaved;
+    descriptions.push(saved.description);
   }
   return descriptions;
 }
@@ -445,8 +529,11 @@ export class DiscordChannel implements Channel {
       );
     });
 
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+
       this.client!.once(Events.ClientReady, (readyClient) => {
+        settled = true;
         logger.info(
           {
             username: readyClient.user.tag,
@@ -462,7 +549,18 @@ export class DiscordChannel implements Channel {
         resolve();
       });
 
-      this.client!.login(this.botToken);
+      this.client!.login(this.botToken).catch((err: unknown) => {
+        if (settled) return;
+        settled = true;
+        const error = err instanceof Error ? err : new Error(String(err));
+        logger.error(
+          { err: error.message, bot: this.label },
+          'Discord bot login failed',
+        );
+        this.client?.destroy();
+        this.client = null;
+        reject(error);
+      });
     });
   }
 
@@ -572,6 +670,7 @@ export function parseDiscordBots(raw?: string): DiscordBotConfig[] {
   if (!value.trim()) return [];
 
   const bots: DiscordBotConfig[] = [];
+  const seenNames = new Set<string>();
   const entries = value.split(';');
   for (let index = 0; index < entries.length; index += 1) {
     const trimmed = entries[index].trim();
@@ -608,7 +707,16 @@ export function parseDiscordBots(raw?: string): DiscordBotConfig[] {
       );
       continue;
     }
-    bots.push({ name, token, triggerName });
+    const normalizedName = name.toLowerCase();
+    if (seenNames.has(normalizedName)) {
+      logger.warn(
+        { entryIndex: index, name: normalizedName },
+        'DISCORD_BOTS: skipping duplicate bot name',
+      );
+      continue;
+    }
+    seenNames.add(normalizedName);
+    bots.push({ name: normalizedName, token, triggerName });
   }
   return bots;
 }

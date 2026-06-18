@@ -85,7 +85,10 @@ vi.mock('discord.js', () => {
       return this.on(event, handler);
     }
 
-    async login(_token: string) {
+    async login(token: string) {
+      if (token === 'reject-token') {
+        throw new Error('Login rejected');
+      }
       this._ready = true;
       // Fire the ready event
       const readyHandlers = this.eventHandlers.get('ready') || [];
@@ -211,6 +214,32 @@ function currentClient() {
   return clientRef.current;
 }
 
+function streamFromChunks(chunks: Array<string | Uint8Array>): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(
+          typeof chunk === 'string' ? new TextEncoder().encode(chunk) : chunk,
+        );
+      }
+      controller.close();
+    },
+  });
+}
+
+function attachmentResponse(
+  body: Array<string | Uint8Array> = ['hello world'],
+  init: { status?: number; headers?: Record<string, string> } = {},
+) {
+  const status = init.status ?? 200;
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: new Headers({ 'content-length': '11', ...init.headers }),
+    body: streamFromChunks(body),
+  };
+}
+
 async function triggerMessage(message: any) {
   const handlers = currentClient().eventHandlers.get('messageCreate') || [];
   for (const h of handlers) await h(message);
@@ -258,12 +287,7 @@ describe('DiscordChannel', () => {
     vi.clearAllMocks();
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => ({
-        ok: true,
-        status: 200,
-        headers: new Headers({ 'content-length': '11' }),
-        arrayBuffer: async () => Buffer.from('hello world'),
-      })),
+      vi.fn(async () => attachmentResponse()),
     );
     await fs.rm(testGroupsDir, { recursive: true, force: true });
   });
@@ -305,6 +329,18 @@ describe('DiscordChannel', () => {
 
       await channel.disconnect();
       expect(channel.isConnected()).toBe(false);
+    });
+
+    it('rejects connect() when Discord login rejects', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('reject-token', opts);
+
+      await expect(channel.connect()).rejects.toThrow('Login rejected');
+      expect(channel.isConnected()).toBe(false);
+      expect(logger.error).toHaveBeenCalledWith(
+        { err: 'Login rejected', bot: 'discord' },
+        'Discord bot login failed',
+      );
     });
 
     it('isConnected() returns false before connect', () => {
@@ -709,6 +745,188 @@ describe('DiscordChannel', () => {
           'utf8',
         ),
       ).resolves.toBe('hello world');
+    });
+
+    it('streams oversized attachment bodies and cleans partial files', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_010);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () =>
+          attachmentResponse(
+            [new Uint8Array(25 * 1024 * 1024), new Uint8Array(1)],
+            { headers: { 'content-length': '' } },
+          ),
+        ),
+      );
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerMessage(
+        createMessage({
+          content: '',
+          guildName: 'Server',
+          attachments: new Map([
+            [
+              'big',
+              {
+                id: 'big',
+                name: 'big.bin',
+                contentType: 'application/octet-stream',
+                url: 'https://cdn.discordapp.com/big.bin',
+              },
+            ],
+          ]),
+        }),
+      );
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: '[File: big.bin]' }),
+      );
+      const attachmentDir = path.join(testGroupsDir, 'test-server', 'attachments');
+      await expect(fs.readdir(attachmentDir)).resolves.toEqual([]);
+    });
+
+    it('rejects redirects to non-Discord hosts', async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () =>
+          attachmentResponse([], {
+            status: 302,
+            headers: { location: 'https://example.com/file.txt' },
+          }),
+        ),
+      );
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerMessage(
+        createMessage({
+          content: '',
+          guildName: 'Server',
+          attachments: new Map([
+            [
+              'redir',
+              {
+                id: 'redir',
+                name: 'file.txt',
+                contentType: 'text/plain',
+                url: 'https://cdn.discordapp.com/file.txt',
+              },
+            ],
+          ]),
+        }),
+      );
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: '[File: file.txt]' }),
+      );
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects non-Discord attachment URLs before fetching', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerMessage(
+        createMessage({
+          content: '',
+          guildName: 'Server',
+          attachments: new Map([
+            [
+              'bad',
+              {
+                id: 'bad',
+                name: 'file.txt',
+                contentType: 'text/plain',
+                url: 'http://cdn.discordapp.com/file.txt',
+              },
+            ],
+          ]),
+        }),
+      );
+
+      expect(global.fetch).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: '[File: file.txt]' }),
+      );
+    });
+
+    it('does not follow symlinked attachment directories outside the group', async () => {
+      const groupDir = path.join(testGroupsDir, 'test-server');
+      const outsideDir = path.join(testGroupsDir, 'outside');
+      await fs.mkdir(groupDir, { recursive: true });
+      await fs.mkdir(outsideDir, { recursive: true });
+      await fs.symlink(outsideDir, path.join(groupDir, 'attachments'));
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerMessage(
+        createMessage({
+          content: '',
+          guildName: 'Server',
+          attachments: new Map([
+            [
+              'att1',
+              {
+                id: 'att1',
+                name: '../unsafe.txt',
+                contentType: 'text/plain',
+                url: 'https://cdn.discordapp.com/file.txt',
+                size: 11,
+              },
+            ],
+          ]),
+        }),
+      );
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: '[File: ../unsafe.txt]' }),
+      );
+      await expect(fs.readdir(outsideDir)).resolves.toEqual([]);
+    });
+
+    it('does not overwrite existing files on filename collision', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_020);
+      const savedRelative = 'attachments/1700000000020-same-file.txt';
+      const savedPath = path.join(testGroupsDir, 'test-server', savedRelative);
+      await fs.mkdir(path.dirname(savedPath), { recursive: true });
+      await fs.writeFile(savedPath, 'original');
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerMessage(
+        createMessage({
+          content: '',
+          guildName: 'Server',
+          attachments: new Map([
+            [
+              'same',
+              {
+                id: 'same',
+                name: 'file.txt',
+                contentType: 'text/plain',
+                url: 'https://cdn.discordapp.com/file.txt',
+                size: 11,
+              },
+            ],
+          ]),
+        }),
+      );
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: '[File: file.txt]' }),
+      );
+      await expect(fs.readFile(savedPath, 'utf8')).resolves.toBe('original');
     });
 
     it('does not download attachments for unregistered guild channels', async () => {

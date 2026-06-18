@@ -16,6 +16,9 @@ export type ChannelFactory = (opts: ChannelOpts) => Channel | null;
 const registry = new Map<string, ChannelFactory>();
 
 export function registerChannel(name: string, factory: ChannelFactory): void {
+  if (registry.has(name)) {
+    throw new Error(`Channel already registered: ${name}`);
+  }
   registry.set(name, factory);
 }
 
