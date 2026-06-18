@@ -86,6 +86,11 @@ vi.mock('discord.js', () => {
       fetch: vi.fn().mockResolvedValue({
         send: vi.fn().mockResolvedValue(undefined),
         sendTyping: vi.fn().mockResolvedValue(undefined),
+        messages: {
+          fetch: vi.fn().mockResolvedValue({
+            author: { username: 'Andy', displayName: 'Andy' },
+          }),
+        },
       }),
     };
 
@@ -206,6 +211,7 @@ async function triggerRawDM(overrides: {
   messageId?: string;
   timestamp?: string;
   attachments?: any[];
+  messageReference?: { message_id?: string };
 }) {
   const packet = {
     t: 'MESSAGE_CREATE',
@@ -223,6 +229,7 @@ async function triggerRawDM(overrides: {
       guild_id: undefined,
       channel_type: 1,
       attachments: overrides.attachments ?? [],
+      message_reference: overrides.messageReference,
     },
   };
   const handlers = currentClient().eventHandlers.get('raw') || [];
@@ -664,6 +671,174 @@ describe('DiscordChannel', () => {
         expect.objectContaining({
           content: '[Reply to Bob] I agree with that',
         }),
+      );
+    });
+  });
+
+  // --- Raw DM gateway handling ---
+  describe('raw DM gateway handling', () => {
+    it('delivers a DM exactly once when raw and high-level events both fire', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({ content: 'same dm', messageId: 'dm_once' });
+      await triggerMessage(
+        createMessage({ content: 'same dm', messageId: 'dm_once' }),
+      );
+
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ id: 'dm_once', content: 'same dm' }),
+      );
+    });
+
+    it('ignores bot-authored raw DMs', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({ authorBot: true, content: 'bot dm' });
+
+      expect(opts.onChatMetadata).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+
+    it('delivers raw DM ids, sender, timestamp, JID, metadata, and text content', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({
+        channelId: '1234567890123456',
+        content: 'plain dm',
+        authorId: 'user_123',
+        authorUsername: 'alice_user',
+        authorGlobalName: 'Alice Global',
+        messageId: 'dm_text_1',
+        timestamp: '2024-02-03T04:05:06.000Z',
+      });
+
+      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        '2024-02-03T04:05:06.000Z',
+        'Alice Global',
+        'discord',
+        false,
+      );
+      expect(opts.onMessage).toHaveBeenCalledWith('dc:1234567890123456', {
+        id: 'dm_text_1',
+        chat_jid: 'dc:1234567890123456',
+        sender: 'user_123',
+        sender_name: 'Alice Global',
+        content: 'plain dm',
+        timestamp: '2024-02-03T04:05:06.000Z',
+        is_from_me: false,
+      });
+    });
+
+    it('handles attachment-only raw DMs deterministically', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({
+        content: '',
+        attachments: [
+          { filename: 'photo.png', content_type: 'image/png' },
+          { filename: 'clip.mp4', content_type: 'video/mp4' },
+          { filename: 'note.txt', content_type: 'text/plain' },
+        ],
+      });
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({
+          content: '[Image: photo.png]\n[Video: clip.mp4]\n[File: note.txt]',
+        }),
+      );
+    });
+
+    it('handles empty raw DMs deterministically', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({ content: '', attachments: [] });
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: '' }),
+      );
+    });
+
+    it('translates raw DM bot mentions like guild messages', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({ content: '<@!999888777> check this' });
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: '@Andy check this' }),
+      );
+    });
+
+    it('adds raw DM reply context like guild messages', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({
+        content: 'yes',
+        messageReference: { message_id: 'bot_reply_1' },
+      });
+
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith('1234567890123456');
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: '[Reply to Andy] yes' }),
+      );
+    });
+
+    it('does not process unregistered raw DMs', async () => {
+      const opts = createTestOpts({ registeredGroups: vi.fn(() => ({})) });
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({ content: '@Andy hello' });
+
+      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.any(String),
+        'Alice',
+        'discord',
+        false,
+      );
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+
+    it('ignores raw guild messages so guild message handling is unchanged', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const rawHandlers = currentClient().eventHandlers.get('raw') || [];
+      for (const h of rawHandlers) {
+        await h({
+          t: 'MESSAGE_CREATE',
+          d: { guild_id: 'guild_1', channel_id: '1234567890123456' },
+        });
+      }
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      await triggerMessage(createMessage({ content: 'guild ok', guildName: 'Server' }));
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: 'guild ok' }),
       );
     });
   });

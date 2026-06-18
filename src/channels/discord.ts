@@ -51,7 +51,7 @@ export class DiscordChannel implements Channel {
     // discord.js v14 does not reliably emit messageCreate for DMs even with
     // Partials.Channel enabled — the raw gateway event is the only reliable
     // source. Guild messages still go through messageCreate below.
-    this.client.on('raw' as any, (packet: any) => {
+    this.client.on('raw' as any, async (packet: any) => {
       if (packet.t !== 'MESSAGE_CREATE' || packet.d.guild_id) return;
 
       const d = packet.d;
@@ -91,6 +91,29 @@ export class DiscordChannel implements Channel {
         content = content
           ? `${content}\n${descriptions.join('\n')}`
           : descriptions.join('\n');
+      }
+
+      // Handle reply context — keep DM formatting aligned with guild messages.
+      if (d.message_reference?.message_id) {
+        try {
+          const channel = await this.client?.channels.fetch(channelId);
+          if (channel && 'messages' in channel) {
+            const repliedTo = await (channel as any).messages.fetch(
+              d.message_reference.message_id,
+            );
+            const replyAuthor =
+              repliedTo.member?.displayName ||
+              repliedTo.author?.displayName ||
+              repliedTo.author?.globalName ||
+              repliedTo.author?.global_name ||
+              repliedTo.author?.username;
+            if (replyAuthor) {
+              content = `[Reply to ${replyAuthor}] ${content}`;
+            }
+          }
+        } catch {
+          // Referenced message may be unavailable.
+        }
       }
 
       // Store chat metadata
