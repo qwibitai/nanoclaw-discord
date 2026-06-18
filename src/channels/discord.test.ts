@@ -7,6 +7,8 @@ import {
   afterEach,
   beforeAll,
 } from 'vitest';
+import fs from 'fs/promises';
+import path from 'path';
 
 // --- Mocks ---
 
@@ -20,6 +22,7 @@ vi.mock('../env.js', () => ({ readEnvFile: vi.fn(() => ({})) }));
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
   TRIGGER_PATTERN: /^@Andy\b/i,
+  GROUPS_DIR: testGroupsDir,
   buildTriggerPattern: (trigger: string) => {
     const escaped = trigger.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return new RegExp(`^${escaped}\\b`, 'i');
@@ -41,6 +44,7 @@ vi.mock('../logger.js', () => ({
 type Handler = (...args: any[]) => any;
 
 const clientRef = vi.hoisted(() => ({ current: null as any }));
+const testGroupsDir = vi.hoisted(() => '/tmp/nanoclaw-discord-test-groups');
 
 vi.mock('discord.js', () => {
   const Events = {
@@ -249,12 +253,23 @@ async function triggerRawDM(overrides: {
 // --- Tests ---
 
 describe('DiscordChannel', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-length': '11' }),
+        arrayBuffer: async () => Buffer.from('hello world'),
+      })),
+    );
+    await fs.rm(testGroupsDir, { recursive: true, force: true });
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   // --- Connection lifecycle ---
@@ -659,6 +674,64 @@ describe('DiscordChannel', () => {
         }),
       );
     });
+
+    it('downloads registered guild attachments into the group attachments folder', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const attachments = new Map([
+        [
+          'att1',
+          {
+            id: 'att1',
+            name: '../unsafe report.pdf',
+            contentType: 'application/pdf',
+            url: 'https://cdn.discordapp.com/report.pdf',
+            size: 11,
+          },
+        ],
+      ]);
+      await triggerMessage(
+        createMessage({ content: '', attachments, guildName: 'Server' }),
+      );
+
+      const savedRelative = 'attachments/1700000000000-att1-unsafe_report.pdf';
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: `[PDF: ${savedRelative}]` }),
+      );
+      await expect(
+        fs.readFile(
+          path.join(testGroupsDir, 'test-server', savedRelative),
+          'utf8',
+        ),
+      ).resolves.toBe('hello world');
+    });
+
+    it('does not download attachments for unregistered guild channels', async () => {
+      const opts = createTestOpts({ registeredGroups: vi.fn(() => ({})) });
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const attachments = new Map([
+        [
+          'att1',
+          {
+            name: 'photo.png',
+            contentType: 'image/png',
+            url: 'https://cdn.discordapp.com/photo.png',
+          },
+        ],
+      ]);
+      await triggerMessage(
+        createMessage({ content: '', attachments, guildName: 'Server' }),
+      );
+
+      expect(global.fetch).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
   });
 
   // --- Reply context ---
@@ -768,6 +841,38 @@ describe('DiscordChannel', () => {
           content: '[Image: photo.png]\n[Video: clip.mp4]\n[File: note.txt]',
         }),
       );
+    });
+
+    it('downloads registered raw DM attachments through the shared attachment path', async () => {
+      vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_001);
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      await triggerRawDM({
+        content: '',
+        attachments: [
+          {
+            id: 'dm1',
+            filename: 'photo.png',
+            content_type: 'image/png',
+            url: 'https://cdn.discordapp.com/photo.png',
+            size: 11,
+          },
+        ],
+      });
+
+      const savedRelative = 'attachments/1700000000001-dm1-photo.png';
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({ content: `[Image: ${savedRelative}]` }),
+      );
+      await expect(
+        fs.readFile(
+          path.join(testGroupsDir, 'test-server', savedRelative),
+          'utf8',
+        ),
+      ).resolves.toBe('hello world');
     });
 
     it('handles empty raw DMs deterministically', async () => {

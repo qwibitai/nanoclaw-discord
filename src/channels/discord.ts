@@ -1,3 +1,6 @@
+import fs from 'fs/promises';
+import path from 'path';
+
 import {
   Client,
   Events,
@@ -7,7 +10,7 @@ import {
   TextChannel,
 } from 'discord.js';
 
-import { ASSISTANT_NAME, buildTriggerPattern } from '../config.js';
+import { ASSISTANT_NAME, buildTriggerPattern, GROUPS_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -17,6 +20,156 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+const DISCORD_ATTACHMENT_TIMEOUT_MS = 15_000;
+const DISCORD_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+let attachmentSaveCounter = 0;
+
+interface DiscordAttachmentLike {
+  id?: string;
+  name?: string | null;
+  filename?: string | null;
+  contentType?: string | null;
+  content_type?: string | null;
+  url?: string | null;
+  size?: number | null;
+}
+
+function attachmentContentType(att: DiscordAttachmentLike): string {
+  return att.contentType || att.content_type || '';
+}
+
+function attachmentName(att: DiscordAttachmentLike): string {
+  return att.name || att.filename || 'file';
+}
+
+function attachmentKind(contentType: string): string {
+  if (contentType.startsWith('image/')) return 'Image';
+  if (contentType.startsWith('video/')) return 'Video';
+  if (contentType.startsWith('audio/')) return 'Audio';
+  if (contentType === 'application/pdf') return 'PDF';
+  return 'File';
+}
+
+function attachmentPlaceholderKind(contentType: string): string {
+  if (contentType.startsWith('image/')) return 'Image';
+  if (contentType.startsWith('video/')) return 'Video';
+  if (contentType.startsWith('audio/')) return 'Audio';
+  return 'File';
+}
+
+function attachmentPlaceholder(att: DiscordAttachmentLike): string {
+  const contentType = attachmentContentType(att);
+  return `[${attachmentPlaceholderKind(contentType)}: ${attachmentName(att)}]`;
+}
+
+function ensureWithinBase(baseDir: string, targetPath: string): void {
+  const relative = path.relative(baseDir, targetPath);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`Path escapes base directory: ${targetPath}`);
+  }
+}
+
+function safeAttachmentFilename(att: DiscordAttachmentLike): string {
+  const base = path
+    .basename(attachmentName(att))
+    .replace(/[^a-zA-Z0-9._-]/g, '_');
+  const safeBase =
+    base && base !== '.' && base !== '..' ? base.slice(0, 120) : 'file';
+  const prefix = [
+    Date.now(),
+    att.id ?? (attachmentSaveCounter = (attachmentSaveCounter + 1) % 1_000_000),
+  ]
+    .filter(
+      (part) => part !== undefined && part !== null && String(part).length > 0,
+    )
+    .map((part) => String(part).replace(/[^a-zA-Z0-9._-]/g, '_'))
+    .join('-');
+  return `${prefix}-${safeBase}`;
+}
+
+async function downloadDiscordAttachment(
+  att: DiscordAttachmentLike,
+): Promise<Buffer> {
+  if (!att.url) throw new Error('Discord attachment is missing a URL');
+  if (att.size && att.size > DISCORD_ATTACHMENT_MAX_BYTES) {
+    throw new Error(
+      `Discord attachment exceeds ${DISCORD_ATTACHMENT_MAX_BYTES} bytes`,
+    );
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    DISCORD_ATTACHMENT_TIMEOUT_MS,
+  );
+  try {
+    const response = await fetch(att.url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(
+        `Discord attachment download failed: HTTP ${response.status}`,
+      );
+    }
+
+    const contentLength = response.headers.get('content-length');
+    if (contentLength && Number(contentLength) > DISCORD_ATTACHMENT_MAX_BYTES) {
+      throw new Error(
+        `Discord attachment exceeds ${DISCORD_ATTACHMENT_MAX_BYTES} bytes`,
+      );
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.byteLength > DISCORD_ATTACHMENT_MAX_BYTES) {
+      throw new Error(
+        `Discord attachment exceeds ${DISCORD_ATTACHMENT_MAX_BYTES} bytes`,
+      );
+    }
+    return buffer;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function saveDiscordAttachment(
+  att: DiscordAttachmentLike,
+  group: RegisteredGroup | undefined,
+): Promise<string> {
+  if (!group || !att.url) return attachmentPlaceholder(att);
+
+  try {
+    const groupDir = path.resolve(GROUPS_DIR, group.folder);
+    ensureWithinBase(path.resolve(GROUPS_DIR), groupDir);
+    const attachDir = path.resolve(groupDir, 'attachments');
+    ensureWithinBase(groupDir, attachDir);
+
+    const buffer = await downloadDiscordAttachment(att);
+    await fs.mkdir(attachDir, { recursive: true });
+
+    const filename = safeAttachmentFilename(att);
+    const filePath = path.resolve(attachDir, filename);
+    ensureWithinBase(attachDir, filePath);
+    await fs.writeFile(filePath, buffer, { flag: 'wx' });
+
+    return `[${attachmentKind(attachmentContentType(att))}: attachments/${filename}]`;
+  } catch (err) {
+    logger.warn(
+      { attName: attachmentName(att), err },
+      'Failed to download Discord attachment',
+    );
+    return attachmentPlaceholder(att);
+  }
+}
+
+async function describeDiscordAttachments(
+  attachments: Iterable<DiscordAttachmentLike>,
+  group: RegisteredGroup | undefined,
+): Promise<string[]> {
+  const descriptions: string[] = [];
+  for (const att of attachments) {
+    descriptions.push(await saveDiscordAttachment(att, group));
+  }
+  return descriptions;
+}
 
 export interface DiscordChannelOpts {
   onMessage: OnInboundMessage;
@@ -85,6 +238,7 @@ export class DiscordChannel implements Channel {
       const msgId = d.id;
       const timestamp = d.timestamp || new Date().toISOString();
       let content = d.content || '';
+      const group = this.opts.registeredGroups()[chatJid];
 
       // Translate @bot mentions into trigger format
       const botId = this.client?.user?.id;
@@ -103,16 +257,10 @@ export class DiscordChannel implements Channel {
 
       // Handle attachments
       if (d.attachments?.length > 0) {
-        const descriptions = d.attachments.map((att: any) => {
-          const ct = att.content_type || '';
-          if (ct.startsWith('image/'))
-            return `[Image: ${att.filename || 'image'}]`;
-          if (ct.startsWith('video/'))
-            return `[Video: ${att.filename || 'video'}]`;
-          if (ct.startsWith('audio/'))
-            return `[Audio: ${att.filename || 'audio'}]`;
-          return `[File: ${att.filename || 'file'}]`;
-        });
+        const descriptions = await describeDiscordAttachments(
+          d.attachments,
+          group,
+        );
         content = content
           ? `${content}\n${descriptions.join('\n')}`
           : descriptions.join('\n');
@@ -151,7 +299,6 @@ export class DiscordChannel implements Channel {
       );
 
       // Only deliver for registered groups
-      const group = this.opts.registeredGroups()[chatJid];
       if (!group) {
         logger.debug(
           { chatJid, chatName: senderName },
@@ -193,6 +340,7 @@ export class DiscordChannel implements Channel {
         message.author.username;
       const sender = message.author.id;
       const msgId = message.id;
+      const group = this.opts.registeredGroups()[chatJid];
 
       // Determine chat name
       const textChannel = message.channel as TextChannel;
@@ -224,19 +372,9 @@ export class DiscordChannel implements Channel {
 
       // Handle attachments — store placeholders so the agent knows something was sent
       if (message.attachments.size > 0) {
-        const attachmentDescriptions = [...message.attachments.values()].map(
-          (att) => {
-            const contentType = att.contentType || '';
-            if (contentType.startsWith('image/')) {
-              return `[Image: ${att.name || 'image'}]`;
-            } else if (contentType.startsWith('video/')) {
-              return `[Video: ${att.name || 'video'}]`;
-            } else if (contentType.startsWith('audio/')) {
-              return `[Audio: ${att.name || 'audio'}]`;
-            } else {
-              return `[File: ${att.name || 'file'}]`;
-            }
-          },
+        const attachmentDescriptions = await describeDiscordAttachments(
+          message.attachments.values(),
+          group,
         );
         if (content) {
           content = `${content}\n${attachmentDescriptions.join('\n')}`;
@@ -274,7 +412,6 @@ export class DiscordChannel implements Channel {
       this.opts.onChatMetadata(chatJid, timestamp, chatName, 'discord', true);
 
       // Only deliver full message for registered groups
-      const group = this.opts.registeredGroups()[chatJid];
       if (!group) {
         logger.debug(
           { chatJid, chatName, bot: this.label },
